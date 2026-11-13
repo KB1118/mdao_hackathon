@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Token Proxy</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; max-width: 1180px; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 16px; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  h3 { font-size: 14px; margin: 18px 0 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  input[type=text], input[type=password], input[type=number] { width: 320px; padding: 4px; }
+  select { padding: 3px; }
+  button { padding: 4px 12px; margin-right: 6px; }
+  .muted { color: #666; font-size: 13px; }
+  .ok { color: #1a7f37; }
+  .bad { color: #b42318; }
+  .field { display: grid; grid-template-columns: 240px 1fr; gap: 4px 12px; align-items: start; margin-bottom: 8px; }
+  .field .help { color: #666; font-size: 12px; grid-column: 2; margin-top: -2px; }
+  .note { color: #8a5a00; font-size: 12px; grid-column: 2; }
+  pre { background: #f6f8fa; padding: 8px; font-size: 12px; overflow: auto; }
+  .tl { margin: 6px 0; padding: 6px 10px; border-left: 3px solid #ccc; font-size: 13px; background: #f6f8fa; word-break: break-word; }
+  .tl-request { border-color: #58a6ff; }
+  .tl-stage { border-color: #bf8700; }
+  .tl-response { border-color: #1a7f37; }
+  .tl-error { border-color: #b42318; background: #fff1f0; }
+  .tl-time { color: #888; margin-right: 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Token Proxy</h1>
+<div class="muted" id="status">Loading...</div>
+
+<h2>Gateway</h2>
+<p><label>Upstream URL <input type="text" id="upstream"></label></p>
+<p><label>API key (optional) <input type="password" id="apikey" placeholder="leave blank to keep the current key"></label></p>
+<p><button id="save-upstream">Save gateway</button><span id="upstream-msg" class="muted"></span></p>
+
+<h2>Models</h2>
+<p class="muted">Ticked models are exposed to Claude Code. Models routed to <code>responses</code> are translated from the Anthropic Messages format to the OpenAI Responses API. "auto" picks the route by model name: <code>gpt-*</code> uses responses, everything else uses anthropic passthrough.</p>
+<p><button id="refresh-models">Refresh from gateway</button><button id="save-models">Save exposed models</button><span id="models-msg" class="muted"></span></p>
+<table>
+  <thead><tr><th>Expose</th><th>Model</th><th>ID</th><th>Route</th></tr></thead>
+  <tbody id="models"></tbody>
+</table>
+
+<h2>Claude Code</h2>
+<p id="claude-state" class="muted"></p>
+<p><button id="apply">Apply to Claude Code</button><button id="restore">Restore original settings</button><span id="claude-msg" class="muted"></span></p>
+<p class="muted">Restart Claude Code after applying or restoring. Your original settings.json is backed up the first time you apply.</p>
+
+<h2>Features and run label</h2>
+<p class="muted">Each feature is an independent flag, read from config.json at every request, so the benchmark harness can flip them between runs without restarting. <b>Session tracing</b> writes the per-session ledger below (metadata and content hashes only — payloads are never stored).</p>
+<div id="features-form"></div>
+<p><button id="features-save">Save feature settings</button><span id="features-msg" class="muted"></span></p>
+
+<h2>Headroom sidecar</h2>
+<p id="sidecar-state" class="muted"></p>
+<p><button id="sidecar-start">Start</button><button id="sidecar-stop">Stop</button><button id="sidecar-restart">Restart</button><span id="sidecar-msg" class="muted"></span></p>
+<p id="model-state" class="muted"></p><p><button id="model-download">Check / download Kompress model</button><span id="model-msg" class="muted"></span></p>
+<div id="headroom-form"></div>
+<p><button id="headroom-save">Save Headroom settings</button><span id="headroom-msg" class="muted"></span></p>
+<h3>Sidecar statistics</h3>
+<pre id="headroom-stats" class="muted">Loading...</pre>
+
+<h2>Sessions</h2>
+<p class="muted" id="sessions-note">Per-session ledger files from <code>data/sessions/</code>. Click a session for its timeline. <button id="sessions-refresh">Refresh</button></p>
+<div id="sessions-listwrap">
+<table>
+  <thead><tr><th>Session</th><th>Source</th><th>Run label</th><th>Requests</th><th>Entries</th><th>Size</th><th>First</th><th>Last</th></tr></thead>
+  <tbody id="sessions"></tbody>
+</table>
+</div>
+<p><button id="sessions-back" style="display:none">Back to sessions</button><span id="session-heading" class="muted"></span></p>
+<div id="session-timeline" style="display:none"></div>
+
+<h2>Usage</h2>
+<p class="muted" id="usage-totals"></p>
+<table>
+  <thead><tr><th>Time</th><th>Model</th><th>Route</th><th>Status</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th>Compressed</th><th>Saved</th><th>Session</th><th>Note</th><th>Gateway cost</th><th>ms</th></tr></thead>
+  <tbody id="usage"></tbody>
+</table>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let gatewayModels = [];
+let headroomSchema = [];
+let featuresSchema = [];
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error?.message || `HTTP ${res.status}`);
+  return body;
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function loadState() {
+  const state = await api("/api/state");
+  $("upstream").value = state.settings.upstream_url;
+  $("status").textContent = `Proxy: ${state.proxy_url}  |  Gateway: ${state.settings.upstream_url}  |  API key: ${state.settings.api_key_set ? "set" : "not set"}`;
+  const claude = state.claude;
+  $("claude-state").innerHTML =
+    (claude.applied ? '<span class="ok">Claude Code is routed through the proxy.</span>'
+                    : '<span class="bad">Claude Code is not routed through the proxy.</span>') +
+    `<br>ANTHROPIC_BASE_URL: ${esc(claude.base_url || "(unset)")}<br>Settings file: ${esc(claude.settings_path)}` +
+    (claude.error ? `<br><span class="bad">${esc(claude.error)}</span>` : "");
+  return state;
+}
+
+async function loadModels() {
+  const state = await loadState();
+  try {
+    const data = await api("/api/gateway/models");
+    gatewayModels = data.models;
+    $("models-msg").textContent = `${gatewayModels.length} models from gateway`;
+  } catch (err) {
+    gatewayModels = state.settings.exposed_models.map((id) => ({ id, display_name: id, exposed: true }));
+    $("models-msg").textContent = `Gateway unavailable: ${err.message}`;
+  }
+  renderModels(state.settings.route_overrides);
+}
+
+function renderModels(overrides) {
+  $("models").innerHTML = gatewayModels.map((m) => {
+    const route = overrides[m.id] || "auto";
+    return `<tr>
+      <td><input type="checkbox" data-expose="${esc(m.id)}" ${m.exposed ? "checked" : ""}></td>
+      <td>${esc(m.display_name)}</td>
+      <td><code>${esc(m.id)}</code></td>
+      <td><select data-route="${esc(m.id)}">
+        ${["auto", "anthropic", "responses"].map((r) => `<option value="${r}" ${r === route ? "selected" : ""}>${r}</option>`).join("")}
+      </select></td>
+    </tr>`;
+  }).join("");
+}
+
+async function saveModels() {
+  const exposed = [...document.querySelectorAll("[data-expose]")].filter((el) => el.checked).map((el) => el.dataset.expose);
+  const routes = {};
+  document.querySelectorAll("[data-route]").forEach((el) => {
+    if (el.value !== "auto") routes[el.dataset.route] = el.value;
+  });
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ exposed_models: exposed, route_overrides: routes }) });
+    $("models-msg").textContent = `Saved ${exposed.length} exposed models`;
+  } catch (err) {
+    $("models-msg").textContent = err.message;
+  }
+  await loadState();
+}
+
+async function saveGateway() {
+  const payload = { upstream_url: $("upstream").value };
+  if ($("apikey").value) payload.api_key = $("apikey").value;
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
+    $("upstream-msg").textContent = "Saved";
+    $("apikey").value = "";
+    await loadModels();
+  } catch (err) {
+    $("upstream-msg").textContent = err.message;
+  }
+}
+
+async function claudeAction(action) {
+  try {
+    await api(`/api/claude/${action}`, { method: "POST" });
+    $("claude-msg").textContent = action === "apply" ? "Applied" : "Restored";
+  } catch (err) {
+    $("claude-msg").textContent = err.message;
+  }
+  await loadState();
+}
+
+function fieldHtml(entry, value) {
+  const id = `h-${entry.key}`;
+  const disabled = entry.available === false ? "disabled" : "";
+  const note = entry.available === false ? '<div class="note">Not available in this build.</div>' : "";
+  let input;
+  if (entry.type === "bool") {
+    input = `<input type="checkbox" id="${id}" data-key="${entry.key}" ${value ? "checked" : ""} ${disabled}>`;
+  } else if (entry.type === "choice") {
+    input = `<select id="${id}" data-key="${entry.key}" ${disabled}>${entry.choices.map((c) =>
+      `<option value="${esc(c)}" ${c === value ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+  } else if (entry.type === "int" || entry.type === "float") {
+    input = `<input type="number" id="${id}" data-key="${entry.key}" data-type="${entry.type}" value="${value ?? ""}" ${disabled}>`;
+  } else {
+    input = `<input type="text" id="${id}" data-key="${entry.key}" value="${esc(value ?? "")}" ${disabled}>`;
+  }
+  return `<div class="field"><label for="${id}">${esc(entry.label)}</label><div>${input}</div>
+    <div class="help">${esc(entry.help)}</div>${note}</div>`;
+}
+
+function renderHeadroomForm(schema, values) {
+  const groups = [];
+  schema.forEach((entry) => {
+    if (!groups.includes(entry.group)) groups.push(entry.group);
+  });
+  $("headroom-form").innerHTML = groups.map((group) =>
+    `<h3>${esc(group)}</h3>` + schema.filter((e) => e.group === group).map((e) => fieldHtml(e, values[e.key])).join("")
+  ).join("");
+}
+
+function readHeadroomForm() {
+  const values = {};
+  document.querySelectorAll("#headroom-form [data-key]").forEach((el) => {
+    const entry = headroomSchema.find((e) => e.key === el.dataset.key);
+    if (!entry || el.disabled) return;
+    if (el.type === "checkbox") values[entry.key] = el.checked;
+    else if (el.tagName === "SELECT") values[entry.key] = el.value;
+    else if (el.type === "number") values[entry.key] = el.value === "" ? null : Number(el.value);
+    else values[entry.key] = el.value;
+  });
+  return values;
+}
+
+async function loadHeadroom() {
+  const data = await api("/api/headroom");
+  headroomSchema = data.schema;
+  renderHeadroomForm(data.schema, data.values);
+  const s = data.sidecar;
+  $("sidecar-state").innerHTML =
+    (s.running ? '<span class="ok">Sidecar running</span>' : '<span class="bad">Sidecar stopped</span>') +
+    (s.running ? (s.healthy ? ", healthy" : ", not answering health checks yet") : "") +
+    ` &middot; port ${esc(data.sidecar_url.split(":").pop())}` +
+    (s.pid ? ` &middot; pid ${s.pid}` : "") +
+    `<br>Log: ${esc(s.log_path)}`;
+  try {
+    const stats = await api("/api/headroom/stats");
+    $("headroom-stats").textContent = JSON.stringify(stats, null, 2).slice(0, 4000);
+  } catch (err) {
+    $("headroom-stats").textContent = `Stats unavailable: ${err.message}`;
+  }
+}
+
+async function saveHeadroom() {
+  try {
+    const result = await api("/api/headroom", { method: "PUT", body: JSON.stringify({ values: readHeadroomForm() }) });
+    $("headroom-msg").textContent = result.restarted ? "Saved; sidecar restarted with the new settings" : "Saved";
+  } catch (err) {
+    $("headroom-msg").textContent = err.message;
+  }
+  await loadHeadroom();
+}
+
+async function sidecarAction(action) {
+  try {
+    await api(`/api/headroom/${action}`, { method: "POST" });
+    $("sidecar-msg").textContent = `${action} requested`;
+  } catch (err) {
+    $("sidecar-msg").textContent = err.message;
+  }
+  await loadHeadroom();
+}
+
+function renderFormInto(containerId, schema, values) {
+  const groups = [];
+  schema.forEach((entry) => { if (!groups.includes(entry.group)) groups.push(entry.group); });
+  $(containerId).innerHTML = groups.map((group) =>
+    `<h3>${esc(group)}</h3>` + schema.filter((e) => e.group === group).map((e) => fieldHtml(e, values[e.key])).join("")
+  ).join("");
+}
+
+async function loadModelCache() {
+  try {
+    const s = await api("/api/headroom/model");
+    const missing = (s.missing || []).length;
+    let html;
+    if (s.status === "cached") html = '<span class="ok">Kompress model cached</span>';
+    else if (s.status === "downloading") html = '<span class="bad">Downloading Kompress model…</span> the sidecar restarts automatically when the cache is warm';
+    else if (s.status === "error") html = `<span class="bad">Cache problem: ${esc(s.detail || "unknown error")}</span>${missing ? ` — missing: ${esc(s.missing.join(", "))}` : ""}`;
+    else html = `<span class="bad">Kompress model not cached</span> (${missing} file(s) missing) — ML compression stays off until downloaded`;
+    $("model-state").innerHTML = html;
+  } catch (err) {
+    $("model-state").innerHTML = `Model cache status unavailable: ${esc(err.message)}`;
+  }
+}
+
+async function downloadModel() {
+  $("model-msg").textContent = "Checking…";
+  try {
+    const s = await api("/api/headroom/model", { method: "POST" });
+    $("model-msg").textContent = s.status === "cached" ? "Already cached" :
+      s.status === "downloading" ? "Download started — the sidecar restarts itself when finished" :
+      s.status === "error" ? `Failed: ${s.detail || "unknown error"}` : `Status: ${s.status}`;
+  } catch (err) {
+    $("model-msg").textContent = err.message;
+  }
+  await loadModelCache();
+}
+
+async function loadFeatures() {
+  const data = await api("/api/features");
+  featuresSchema = data.schema;
+  renderFormInto("features-form", data.schema, data.values);
+}
+
+async function saveFeatures() {
+  const values = {};
+  document.querySelectorAll("#features-form [data-key]").forEach((el) => {
+    values[el.dataset.key] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  try {
+    await api("/api/features", { method: "PUT", body: JSON.stringify({ values }) });
+    $("features-msg").textContent = "Saved — takes effect on the next request, no restart needed";
+  } catch (err) {
+    $("features-msg").textContent = err.message;
+  }
+  await loadFeatures();
+}
+
+async function loadSessions() {
+  const data = await api("/api/sessions");
+  const sessions = data.sessions;
+  $("sessions-note").textContent = sessions.length
+    ? `${sessions.length} ledger file(s). Click a session for its timeline.`
+    : "No ledger files yet. Turn on session tracing and send some traffic.";
+  $("sessions").innerHTML = sessions.map((s) => `<tr data-key="${esc(s.key)}" style="cursor:pointer">
+    <td><code>${esc(s.session_key || s.key)}</code></td>
+    <td>${esc(s.session_source || "-")}</td>
+    <td>${esc(s.run_label || "-")}</td>
+    <td>${fmt(s.requests)}</td>
+    <td>${fmt(s.entries)}</td>
+    <td>${fmt(s.size_bytes)}</td>
+    <td>${s.first_ts ? new Date(s.first_ts).toLocaleString() : "-"}</td>
+    <td>${s.last_ts ? new Date(s.last_ts).toLocaleString() : "-"}</td>
+  </tr>`).join("");
+}
+
+function describeEntry(e) {
+  if (e.type === "request") {
+    const msgs = (e.messages || []).map((m) => {
+      const blocks = Object.entries(m.block_counts || {}).map(([k, n]) => `${esc(k)}&times;${n}`).join(", ");
+      return `${esc(m.role)} ${fmt(m.chars)}ch [${blocks}]`;
+    }).join(" &middot; ");
+    const model = esc(e.model) + (e.requested_model && e.requested_model !== e.model ? ` (requested ${esc(e.requested_model)})` : "");
+    const system = e.system ? ` &middot; system ${fmt(e.system.chars)}ch` : "";
+    const tools = e.tools ? ` &middot; tools ${e.tools.count}` : "";
+    return `→ request &middot; <b>${model}</b> &middot; ${esc(e.route)}${e.stream ? " &middot; stream" : ""} &middot; ${e.message_count} message(s)${system}${tools}<br>${msgs}`;
+  }
+  if (e.type === "stage") {
+    const p = e.provenance || {};
+    const tokens = p.tokens_saved > 0
+      ? `saved ${fmt(p.tokens_saved)} (${fmt(p.tokens_before)} &rarr; ${fmt(p.tokens_after)})`
+      : "nothing saved";
+    const parts = [`<b>${esc(e.feature)}</b> &middot; ${tokens} &middot; attempt ${p.attempts}`];
+    if (p.duration_ms != null) parts.push(`${fmt(p.duration_ms)}ms`);
+    if (p.fallback) parts.push(`<span class="bad">${esc(p.fallback)}</span>`);
+    if (p.turn_id) parts.push(`turn ${esc(p.turn_id).slice(0, 8)}`);
+    return `⚙ stage &middot; ${parts.join(" &middot; ")}`;
+  }
+  if (e.type === "response") {
+    const u = e.usage || {};
+    const content = e.content ? ` &middot; response ${fmt(e.content.chars)}ch [${Object.entries(e.content.block_counts || {}).map(([k, n]) => `${esc(k)}&times;${n}`).join(", ")}]` : "";
+    return `&larr; response &middot; status <b>${e.status}</b> &middot; ${fmt(e.duration_ms)}ms` +
+      ` &middot; in ${fmt(u.input)} / out ${fmt(u.output)} &middot; cache read ${fmt(u.cache_read)} / write ${fmt(u.cache_write)}` +
+      (e.stop_reason ? ` &middot; stop: ${esc(e.stop_reason)}` : "") + content;
+  }
+  if (e.type === "error") {
+    return `! error &middot; <b>${esc(e.stage)}</b> &middot; ${esc(e.message)}`;
+  }
+  return esc(JSON.stringify(e));
+}
+
+async function showSession(key) {
+  const data = await api(`/api/sessions/${encodeURIComponent(key)}`);
+  $("session-heading").innerHTML = `${esc(data.session_key || key)} &middot; ${esc(data.session_source || "-")}` +
+    (data.run_label ? ` &middot; run <b>${esc(data.run_label)}</b>` : "");
+  $("session-timeline").innerHTML = data.entries.map((e) =>
+    `<div class="tl tl-${esc(e.type)}"><span class="tl-time">${new Date(e.ts).toLocaleTimeString()}</span>` +
+    `<span class="muted">request ${esc(String(e.request_id || "").slice(0, 8))}</span><br>${describeEntry(e)}</div>`
+  ).join("");
+  $("sessions-listwrap").style.display = "none";
+  $("session-timeline").style.display = "block";
+  $("sessions-back").style.display = "inline-block";
+}
+
+function backToSessions() {
+  $("sessions-listwrap").style.display = "block";
+  $("session-timeline").style.display = "none";
+  $("sessions-back").style.display = "none";
+  $("session-heading").textContent = "";
+}
+
+function fmt(n) { return n == null ? "-" : Number(n).toLocaleString(); }
+function money(v) { if (v == null) return "-"; const n = Number(String(v).split(": ").pop()); return Number.isFinite(n) ? n.toPrecision(3) : String(v); }
+
+async function loadUsage() {
+  const [data, totals] = await Promise.all([api("/api/usage?limit=50"), api("/api/usage/totals")]);
+  $("usage-totals").textContent =
+    `${fmt(totals.requests)} requests &middot; ${fmt(totals.compressed_requests)} compressed &middot; ` +
+    `${fmt(totals.tokens_saved)} tokens saved (${fmt(totals.tokens_before)} before, ${fmt(totals.tokens_after)} after) &middot; ` +
+    `${fmt(totals.fallbacks)} fallbacks &middot; cache read ${fmt(totals.cache_read_tokens)}, cache write ${fmt(totals.cache_write_tokens)}`;
+  $("usage").innerHTML = data.rows.map((r) => {
+    const session = r.session_source ? `${esc(r.session_source)}${r.session_replayed ? " (replayed)" : ""}` : "-";
+    const note = r.fallback ? `<span class="bad">${esc(r.fallback)}</span>` : (r.relayed ? "relayed" : "");
+    return `<tr>
+    <td>${new Date(r.ts * 1000).toLocaleString()}</td>
+    <td>${esc(r.model)}</td>
+    <td>${esc(r.route)}${r.stream ? " (stream)" : ""}</td>
+    <td>${r.status}</td>
+    <td>${fmt(r.input_tokens)}</td>
+    <td>${fmt(r.output_tokens)}</td>
+    <td>${fmt(r.cache_read_tokens)}</td>
+    <td>${fmt(r.cache_write_tokens)}</td>
+    <td>${r.compressed ? "yes" : "no"}</td>
+    <td>${fmt(r.tokens_saved)}</td>
+    <td>${session}</td>
+    <td>${note}</td>
+    <td>${money(r.cost_reported)}</td>
+    <td>${r.duration_ms}</td>
+  </tr>`;
+  }).join("");
+}
+
+$("save-upstream").onclick = saveGateway;
+$("refresh-models").onclick = loadModels;
+$("save-models").onclick = saveModels;
+$("apply").onclick = () => claudeAction("apply");
+$("restore").onclick = () => claudeAction("restore");
+$("headroom-save").onclick = saveHeadroom;
+$("sidecar-start").onclick = () => sidecarAction("start");
+$("sidecar-stop").onclick = () => sidecarAction("stop");
+$("sidecar-restart").onclick = () => sidecarAction("restart");
+$("features-save").onclick = saveFeatures;
+$("model-download").onclick = downloadModel;
+$("sessions-refresh").onclick = loadSessions;
+$("sessions-back").onclick = backToSessions;
+$("sessions").addEventListener("click", (ev) => {
+  const tr = ev.target.closest("tr[data-key]");
+  if (tr) showSession(tr.dataset.key);
+});
+
+loadModels();
+loadHeadroom();
+loadFeatures();
+loadModelCache();
+loadSessions();
+loadUsage();
+setInterval(loadUsage, 5000);
+setInterval(loadHeadroom, 15000);
+setInterval(loadModelCache, 8000);
+setInterval(loadSessions, 8000);
+</script>
+</body>
+</html>

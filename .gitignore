@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+*.log
+
+# Local data / secrets
+token_proxy/probe_data/
+token_proxy/data/config.json
+data/
+probe_data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
